@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Datasets and training outputs (too large for git)
+datasets/
+runs/
+wandb/
+
+# Model weights and exports
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# macOS
+.DS_Store
