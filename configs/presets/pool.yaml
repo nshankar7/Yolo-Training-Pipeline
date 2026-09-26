@@ -1,0 +1,4 @@
+# Clear pool water only (competition setting).
+underwater:
+  water_types:
+    freshwater: {weight: 0.0}

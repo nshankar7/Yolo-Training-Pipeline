@@ -1,0 +1,12 @@
+# Stress set: worst-case murk.
+output: {root: datasets/stress_turbid}
+splits:
+  train: {count: 0}
+  val:   {count: 500, stream: 10}
+underwater:
+  water_types:
+    pool: {weight: 0.0}
+    freshwater:
+      weight: 1.0
+      beta: [[1.0, 1.8], [0.7, 1.3], [1.0, 2.0]]
+  forward_scatter_blur_k: [0.1, 0.4]

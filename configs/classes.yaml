@@ -1,0 +1,47 @@
+# Class registry. The order of this list IS the YOLO class id order, so only ever append.
+#
+# mirror: what a design becomes when flipped.
+#   none         - flipping produces something that is not a valid class (the default)
+#   self         - the design is symmetric, so flipping is a safe augmentation
+#   <class name> - flipping produces that other class; mappings must be symmetric
+#
+# derive: build this class's artwork by flipping another class's, at ingest time.
+#   Use it when a design is exactly the mirror of one you already drew. The generator then
+#   never has to flip anything while making images.
+#
+# roll_dist: how in-plane rotation is drawn.
+#   normal  - stays near upright (use for designs that read as another class when turned)
+#   uniform - any angle in +/- max_roll_deg is equally likely
+#
+# These two classes match the supplied example: a loop arrow that circles one way, and its
+# mirror image, which circles the other way. Rotating a loop arrow does NOT change which way
+# it loops, so the full rotation range is allowed; mirroring it DOES, which is why the mirror
+# is a separate class and why training has fliplr forced to 0.
+
+classes:
+  - name: loop_ccw
+    max_roll_deg: 180        # a rotated loop still loops the same way
+    roll_dist: uniform
+    mirror: {hflip: loop_cw, vflip: loop_cw}
+
+  - name: loop_cw
+    max_roll_deg: 180
+    roll_dist: uniform
+    mirror: {hflip: loop_ccw, vflip: loop_ccw}
+    derive: {from: loop_ccw, op: hflip}
+
+# Add further designs by appending, e.g. a 90-degree turn pair. `arrowgen placeholders
+# --design turn90 --design uturn` writes stand-in artwork for those.
+#  - name: turn90_left
+#    max_roll_deg: 15
+#    mirror: {hflip: turn90_right, vflip: none}
+#  - name: turn90_right
+#    max_roll_deg: 15
+#    mirror: {hflip: turn90_left, vflip: none}
+#    derive: {from: turn90_left, op: hflip}
+
+# Per-class ingest hints. 'auto' picks RGBA when the file has real transparency, otherwise
+# colour-keys the background away - which is what removes the teal square from flat artwork.
+ingest_overrides: {}
+#  loop_ccw: {method: colorkey, key_tolerance: 24.0}
+#  some_photo_class: {method: photo}     # needs: uv sync --extra photo

@@ -1,0 +1,390 @@
+"""Command line: ingest -> generate -> preview/stats -> train -> eval, or all of it via run."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from .classes import load_classes
+from .config import load_generate_config
+from .ingest import ingest_all, review_sheet
+from .placeholders import DESIGNS, write_placeholder_assets
+from .registry import ROLE_TRAIN, ROLE_VAL
+
+DEFAULT_CONFIG = Path("configs/generate.yaml")
+DEFAULT_TRAIN_CONFIG = Path("configs/train.yaml")
+
+
+def _add_config_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "-c", "--config", action="append", type=Path, default=None,
+        help="generation config; repeat to layer presets (later files win)",
+    )
+    p.add_argument(
+        "--set", action="append", dest="sets", default=[], metavar="KEY=VALUE",
+        help="override a config value, e.g. --set object.pose.yaw_deg='[-30, 30]'",
+    )
+
+
+def _load_cfg(args: argparse.Namespace):
+    paths = args.config or [DEFAULT_CONFIG]
+    missing = [str(p) for p in paths if not Path(p).exists()]
+    if missing:
+        raise SystemExit(f"config file(s) not found: {', '.join(missing)}")
+    return load_generate_config(paths, args.sets)
+
+
+def cmd_placeholders(args: argparse.Namespace) -> int:
+    written = write_placeholder_assets(args.raw, tuple(args.design or ["loop"]))
+    print(f"wrote {len(written)} placeholder source images under {args.raw}:")
+    for p in written:
+        print(f"  {p}")
+    print("\nReplace these with the real artwork, then run: arrowgen ingest")
+    return 0
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    return _ingest(args.classes, args.raw, args.out, args.max_side, args.review)
+
+
+def _ingest(classes: Path, raw: Path, out: Path, max_side: int, review: Path) -> int:
+    classes_cfg = load_classes(classes)
+    results = ingest_all(classes_cfg, raw, out, max_side)
+    by_class: dict[str, int] = {}
+    for r in results:
+        by_class[r.class_name] = by_class.get(r.class_name, 0) + 1
+    print(f"processed {len(results)} assets into {out}")
+    for name in classes_cfg.names:
+        derived = classes_cfg.by_name(name).derive
+        suffix = f"  (mirrored from {derived.source})" if derived else ""
+        print(f"  [{classes_cfg.class_id(name)}] {name:<18} {by_class.get(name, 0)} assets{suffix}")
+    sheet = review_sheet(results, review)
+    print(f"\nreview sheet: {sheet}")
+    print("Check that every cutout is clean and its red outline hugs the arrow.")
+    return 0
+
+
+def cmd_generate(args: argparse.Namespace) -> int:
+    from .writer import generate_dataset  # noqa: PLC0415
+
+    cfg = _load_cfg(args)
+    if args.train is not None:
+        cfg.splits.train.count = args.train
+    if args.val is not None:
+        cfg.splits.val.count = args.val
+    if args.seed is not None:
+        cfg.seed = args.seed
+    if args.out is not None:
+        cfg = cfg.model_copy(update={"output": cfg.output.model_copy(update={"root": args.out})})
+        cfg = cfg.resolved(Path.cwd())
+
+    summary = generate_dataset(
+        cfg, workers=args.workers, overwrite=args.overwrite, progress=not args.quiet
+    )
+    _print_summary(summary)
+    return 0
+
+
+def _print_summary(summary: dict) -> None:
+    print(f"\ndataset: {summary['root']}")
+    print(f"data.yaml: {summary['data_yaml']}")
+    for split, s in summary["splits"].items():
+        print(
+            f"  {split}: {s['images']} images, {s['objects']} objects, "
+            f"{s['negatives']} background-only ({s['negative_fraction']:.1%})"
+        )
+        print(f"    class share: {json.dumps(s['class_share'])}")
+        if s["rejections"]:
+            top = list(s["rejections"].items())[:3]
+            print(f"    top rejections: {', '.join(f'{k}={v}' for k, v in top)}")
+
+
+def cmd_preview(args: argparse.Namespace) -> int:
+    from .preview import preview_dataset, preview_generated  # noqa: PLC0415
+    from .sample import GenContext  # noqa: PLC0415
+
+    cfg = _load_cfg(args)
+    role = ROLE_VAL if args.split.startswith("val") else ROLE_TRAIN
+    if args.dataset is not None:
+        names = load_classes(cfg.classes_file).names
+        out = preview_dataset(args.dataset, args.split, args.n, names, args.out, args.cols)
+        print(f"wrote {out} (boxes read back from the written label files)")
+        return 0
+    ctx = GenContext.build(cfg)
+    stream = cfg.splits.val.stream if role == ROLE_VAL else cfg.splits.train.stream
+    out = preview_generated(ctx, args.n, stream, args.start, role, args.out, args.cols)
+    print(f"wrote {out}")
+    return 0
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    from .stats import report  # noqa: PLC0415
+
+    print(report(args.dataset, args.split))
+    return 0
+
+
+def cmd_bench(args: argparse.Namespace) -> int:
+    from .sample import GenContext, estimate_throughput  # noqa: PLC0415
+
+    cfg = _load_cfg(args)
+    ctx = GenContext.build(cfg)
+    rate = estimate_throughput(ctx, args.n)
+    width, height = cfg.output.image_size
+    print(f"{rate:.1f} images/s single process ({width}x{height})")
+    print(f"~{rate * args.workers:.0f} images/s estimated with {args.workers} workers")
+    return 0
+
+
+def _load_train_cfg(args: argparse.Namespace):
+    from .train import load_train_config  # noqa: PLC0415
+
+    path = Path(args.train_config)
+    if not path.exists():
+        # Only the default may be absent. A path the user typed that does not exist is a
+        # mistake, and silently training with built-in defaults would hide it.
+        if path != DEFAULT_TRAIN_CONFIG:
+            raise SystemExit(f"train config not found: {path}")
+        return load_train_config([], args.set_train)
+    return load_train_config([path], args.set_train)
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    from .train import run_train, train_rounds  # noqa: PLC0415
+
+    train_cfg = _load_train_cfg(args)
+    if args.rounds and args.rounds >= 1:
+        cfg = _load_cfg(args)
+        history = train_rounds(
+            cfg, train_cfg, args.rounds, workers=args.workers, fresh=args.fresh
+        )
+        print(f"\ncompleted {len(history)} rounds; history: {Path(cfg.output.root) / 'rounds.csv'}")
+        return 0
+
+    data_yaml = args.data
+    if data_yaml is None:
+        cfg = _load_cfg(args)
+        data_yaml = Path(cfg.output.root) / "data.yaml"
+    if not Path(data_yaml).exists():
+        raise SystemExit(f"data.yaml not found: {data_yaml}. Run 'arrowgen generate' first.")
+    _, save_dir = run_train(train_cfg, Path(data_yaml))
+    print(f"\nrun directory: {save_dir}")
+    return 0
+
+
+def _stress_sets(args: argparse.Namespace) -> dict[str, Path]:
+    from .evaluate import prepare_stress_sets  # noqa: PLC0415
+
+    return prepare_stress_sets(
+        args.config or [DEFAULT_CONFIG], args.sets, root=args.stress_root,
+        workers=args.workers, progress=not args.quiet,
+    )
+
+
+def _report(weights: Path, datasets: dict[str, Path], train_cfg, out: Path) -> None:
+    from .evaluate import evaluate, format_table, write_csv  # noqa: PLC0415
+
+    rows = evaluate(weights, datasets, train_cfg)
+    print(f"\nweights: {weights}\n")
+    print(format_table(rows))
+    print(f"\nwrote {write_csv(rows, out)}")
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    train_cfg = _load_train_cfg(args)
+    if not Path(args.weights).exists():
+        raise SystemExit(f"weights not found: {args.weights}")
+    datasets = {Path(d).parent.name: Path(d) for d in args.data}
+    if args.stress:
+        datasets.update(_stress_sets(args))
+    if not datasets:
+        datasets = {"val": Path(_load_cfg(args).output.root) / "data.yaml"}
+    missing = [str(d) for d in datasets.values() if not d.exists()]
+    if missing:
+        raise SystemExit(f"data.yaml not found: {', '.join(missing)}")
+    out = args.out or Path(args.weights).resolve().parent.parent / "eval.csv"
+    _report(Path(args.weights), datasets, train_cfg, out)
+    return 0
+
+
+def _ingest_is_stale(cfg, raw: Path) -> bool:
+    """True when the processed artwork is missing or older than what it is made from."""
+    processed = Path(cfg.processed_dir)
+    names = load_classes(cfg.classes_file).names
+    outputs = list(processed.rglob("*.png"))
+    if not outputs or any(not any((processed / n).glob("*.png")) for n in names):
+        return True
+    sources = [p for p in Path(raw).rglob("*") if p.is_file()] + [Path(cfg.classes_file)]
+    return max(p.stat().st_mtime for p in sources) > min(p.stat().st_mtime for p in outputs)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """ingest -> generate -> train -> evaluate, skipping any step that is already done."""
+    from .train import completed_rounds, run_train, train_rounds  # noqa: PLC0415
+    from .writer import generate_dataset, split_is_current, split_plans  # noqa: PLC0415
+
+    cfg = _load_cfg(args)
+    train_cfg = _load_train_cfg(args)  # a bad train config should fail now, not in hours
+    root = Path(cfg.output.root)
+
+    print("== 1/4 ingest")
+    if args.skip_ingest:
+        print("skipped (--skip-ingest)")
+    elif _ingest_is_stale(cfg, args.raw):
+        _ingest(Path(cfg.classes_file), args.raw, Path(cfg.processed_dir), args.max_side,
+                Path(cfg.processed_dir) / "_review.jpg")
+    else:
+        print(f"up to date: {cfg.processed_dir}")
+
+    if args.rounds >= 1:
+        print(f"== 2-3/4 generate and train, {args.rounds} rounds")
+        train_rounds(cfg, train_cfg, args.rounds, workers=args.workers,
+                     progress=not args.quiet, fresh=args.fresh)
+        last = completed_rounds(root / "rounds.csv")[-1]
+        weights = Path(last["weights"])
+        val_yaml = root / f"data_r{int(last['round']):03d}.yaml"
+    else:
+        print("== 2/4 generate")
+        plans = [p for p in split_plans(cfg) if p.count > 0]
+        if (root / "data.yaml").exists() and all(split_is_current(cfg, p) for p in plans):
+            print(f"up to date: {root}")
+        else:
+            _print_summary(generate_dataset(
+                cfg, workers=args.workers, overwrite=True, progress=not args.quiet
+            ))
+        print("== 3/4 train")
+        _, save_dir = run_train(train_cfg, root / "data.yaml")
+        best = save_dir / "weights" / "best.pt"
+        weights = best if best.exists() else save_dir / "weights" / "last.pt"
+        val_yaml = root / "data.yaml"
+
+    print("== 4/4 evaluate")
+    datasets = {"val": val_yaml}
+    if args.stress:
+        datasets.update(_stress_sets(args))
+    _report(weights, datasets, train_cfg, weights.resolve().parent.parent / "eval.csv")
+    return 0
+
+
+def _add_train_config_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("-t", "--train-config", type=Path, default=DEFAULT_TRAIN_CONFIG)
+    p.add_argument("--set-train", action="append", default=[], metavar="KEY=VALUE")
+
+
+def _add_stress_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--stress", action="store_true",
+                   help="also score the stress presets (generated if missing or stale)")
+    p.add_argument("--stress-root", type=Path,
+                   help="write stress sets under this folder instead of their preset roots")
+    p.add_argument("--quiet", action="store_true")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="arrowgen",
+        description="Synthetic turn-arrow dataset generator for Ultralytics YOLO",
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sp = sub.add_parser("placeholders", help="write placeholder arrow artwork to get started")
+    sp.add_argument("--raw", type=Path, default=Path("assets/arrows/raw"))
+    sp.add_argument(
+        "--design", action="append", choices=list(DESIGNS),
+        help="which stand-in design(s) to write (default: loop)",
+    )
+    sp.set_defaults(func=cmd_placeholders)
+
+    sp = sub.add_parser("ingest", help="turn raw artwork into RGBA cutouts with outlines")
+    sp.add_argument("--classes", type=Path, default=Path("configs/classes.yaml"))
+    sp.add_argument("--raw", type=Path, default=Path("assets/arrows/raw"))
+    sp.add_argument("--out", type=Path, default=Path("assets/arrows/processed"))
+    sp.add_argument("--max-side", type=int, default=768)
+    sp.add_argument("--review", type=Path, default=Path("assets/arrows/processed/_review.jpg"))
+    sp.set_defaults(func=cmd_ingest)
+
+    sp = sub.add_parser("generate", help="write a YOLO dataset")
+    _add_config_args(sp)
+    sp.add_argument("--train", type=int, help="number of training images")
+    sp.add_argument("--val", type=int, help="number of validation images")
+    sp.add_argument("--out", type=Path, help="output root (overrides config)")
+    sp.add_argument("--seed", type=int)
+    sp.add_argument("--workers", type=int, default=0, help="worker processes (0 or 1 = inline)")
+    sp.add_argument("--overwrite", action="store_true")
+    sp.add_argument("--quiet", action="store_true")
+    sp.set_defaults(func=cmd_generate)
+
+    sp = sub.add_parser("preview", help="contact sheet of images with their boxes")
+    _add_config_args(sp)
+    sp.add_argument("--dataset", type=Path, help="read a written dataset instead of generating")
+    sp.add_argument("--split", default="train")
+    sp.add_argument("-n", type=int, default=64)
+    sp.add_argument("--start", type=int, default=0)
+    sp.add_argument("--cols", type=int, default=8)
+    sp.add_argument("--out", type=Path, default=Path("preview.jpg"))
+    sp.set_defaults(func=cmd_preview)
+
+    sp = sub.add_parser("stats", help="distribution report from a dataset manifest")
+    sp.add_argument("--dataset", type=Path, required=True)
+    sp.add_argument("--split", default="train")
+    sp.set_defaults(func=cmd_stats)
+
+    sp = sub.add_parser("bench", help="measure generation throughput")
+    _add_config_args(sp)
+    sp.add_argument("-n", type=int, default=20)
+    sp.add_argument("--workers", type=int, default=6)
+    sp.set_defaults(func=cmd_bench)
+
+    sp = sub.add_parser("train", help="train YOLO on a generated dataset")
+    _add_config_args(sp)
+    _add_train_config_args(sp)
+    sp.add_argument("--data", type=Path, help="path to data.yaml")
+    sp.add_argument(
+        "--rounds", type=int, default=0,
+        help="train until N rounds of fresh images are done; re-running resumes",
+    )
+    sp.add_argument("--workers", type=int, default=0, help="generation workers between rounds")
+    sp.add_argument(
+        "--fresh", action="store_true",
+        help="with --rounds: set rounds.csv aside and start from round 0 instead of resuming",
+    )
+    sp.set_defaults(func=cmd_train)
+
+    sp = sub.add_parser("eval", help="score weights on val and the stress sets")
+    _add_config_args(sp)
+    _add_train_config_args(sp)
+    _add_stress_args(sp)
+    sp.add_argument("--weights", type=Path, required=True)
+    sp.add_argument("--data", type=Path, action="append", default=[],
+                    help="data.yaml to score; repeat for several (default: config's dataset)")
+    sp.add_argument("--workers", type=int, default=0, help="stress-set generation workers")
+    sp.add_argument("--out", type=Path, help="CSV path (default: <run dir>/eval.csv)")
+    sp.set_defaults(func=cmd_eval)
+
+    sp = sub.add_parser("run", help="ingest, generate, train and evaluate in one go")
+    _add_config_args(sp)
+    _add_train_config_args(sp)
+    _add_stress_args(sp)
+    sp.add_argument("--raw", type=Path, default=Path("assets/arrows/raw"))
+    sp.add_argument("--max-side", type=int, default=768)
+    sp.add_argument("--skip-ingest", action="store_true")
+    sp.add_argument("--rounds", type=int, default=0,
+                    help="train in N rounds of fresh images instead of one fixed dataset")
+    sp.add_argument("--fresh", action="store_true", help="with --rounds: do not resume")
+    sp.add_argument("--workers", type=int, default=0, help="generation worker processes")
+    sp.set_defaults(func=cmd_run)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except (ValueError, FileNotFoundError, FileExistsError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

@@ -1,0 +1,9 @@
+# Stress set: dim, noisy, compressed footage.
+output: {root: datasets/stress_low_light}
+splits:
+  train: {count: 0}
+  val:   {count: 500, stream: 9}
+effects:
+  exposure_ev: [-2.2, -0.8]
+  noise: {prob: 1.0, shot: [0.01, 0.05], read: [0.005, 0.03]}
+  resolution_loss: {prob: 0.5, factor: [0.35, 0.7]}

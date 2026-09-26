@@ -1,0 +1,115 @@
+# Base generation config. Layer presets on top with repeated -c flags, e.g.
+#   arrowgen generate -c configs/generate.yaml -c configs/presets/pool.yaml
+# and override single values with --set, e.g.
+#   arrowgen generate --set object.pose.yaw_deg='[-30, 30]'
+
+version: 1
+seed: 1337
+classes_file: configs/classes.yaml
+processed_dir: assets/arrows/processed
+train_imgsz: 640                 # the imgsz training will use; min-size checks use it
+
+output:
+  root: datasets/arrows_v1
+  image_size: [960, 720]         # W, H - set this to the AUV camera's aspect ratio
+  jpeg_quality: [70, 95]
+  shard_size: 10000
+
+splits:
+  train: {count: 20000, stream: 0, start: 0}
+  val:   {count: 2000,  stream: 1, start: 0}
+  holdout:
+    backgrounds: 0.1             # fraction of stock photos val-only
+    assets: true                 # hold out one artwork variant per class (needs >= 3)
+
+scene:
+  negative_prob: 0.10            # images with no arrow at all
+  num_objects: {choices: [1, 2, 3, 4], weights: [0.55, 0.25, 0.12, 0.08]}
+  camera_hfov_deg: [60, 90]
+  max_attempts_per_object: 20
+  class_weights: uniform
+
+background:
+  source_probs: {stock: 0.5, procedural: 0.5}   # stock falls back to procedural if empty
+  stock:
+    dirs: [assets/backgrounds/stock]
+    crop_area: [0.3, 1.0]
+    crop_ratio: [0.8, 1.25]
+    hflip_prob: 0.5
+    regrade_prob: 0.8            # make dry photos look submerged
+    regrade_distance_m: [1.0, 6.0]
+  procedural:
+    gradient_power: [0.5, 3.0]
+    gradient_tilt: [-0.3, 0.3]
+    top_gain: [1.0, 1.7]
+    bottom_gain: [0.15, 0.6]
+    noise_octaves: [3, 6]
+    noise_amplitude: [0.02, 0.12]
+
+object:
+  physical_size_m: [0.3, 1.2]    # real-world size of the sign's longest side
+  apparent_size: {dist: loguniform, range: [0.03, 0.6]}   # fraction of image long side
+  aspect_stretch: {dist: loguniform, range: [0.87, 1.15]}
+  pose:
+    roll_std_deg: 6.0            # forward camera: little roll...
+    roll_clip_deg: 15.0          # 'normal' classes only; 'uniform' classes use max_roll_deg
+    yaw_deg: [-60, 60]           # ...but the sign can be seen well off-axis
+    pitch_deg: [-40, 40]
+    max_view_angle_deg: 70
+  placement:
+    truncation_prob: 0.15        # let some arrows run off the frame edge
+    inside_margin_frac: 0.02
+    max_hull_overlap: 0.0        # no overlapping arrows for now
+    max_roi_area_frac: 4.0
+  visibility:
+    min_visible_fraction: 0.6
+    min_side_px_train: 10.0
+    min_contrast_delta_e: 8.0    # an arrow the camera could not distinguish is not drawn
+    min_transmission: 0.10       # skip poses lost in haze before paying to render them
+  appearance:
+    hue_shift_deg: [-8, 8]
+    saturation: [0.7, 1.2]
+    brightness: [0.6, 1.2]
+    illumination_gradient: [0.0, 0.4]
+    edge_feather_px: [0.0, 1.2]
+  board:
+    # The placard the arrow is printed on. It is generated rather than baked into the
+    # artwork so its colour varies: a fixed colour would be the easiest thing in the image
+    # for the model to latch onto, and it would learn the placard instead of the arrow.
+    prob: 0.5                  # the rest of the time the bare glyph is pasted
+    square: true
+    padding_frac: [0.10, 0.40]
+    corner_frac: [0.0, 0.25]
+    palette:                   # sRGB, first entry is the teal from the example
+      - [47, 193, 211]
+      - [240, 240, 235]
+      - [245, 200, 40]
+      - [225, 110, 40]
+      - [35, 40, 50]
+    colour_jitter: 0.12
+    label_target: glyph        # 'glyph' boxes the arrow, 'board' boxes the whole placard
+    min_glyph_contrast_delta_e: 12.0
+
+underwater:
+  # beta = per-metre attenuation, [R, G, B]; higher means the colour is lost faster.
+  # veil_rgb = the colour haze tends towards, sRGB 0-255.
+  water_types:
+    pool:
+      weight: 0.5
+      beta: [[0.15, 0.35], [0.03, 0.08], [0.02, 0.06]]
+      veil_rgb: [[20, 90], [120, 200], [160, 235]]
+    freshwater:
+      weight: 0.5
+      beta: [[0.50, 1.20], [0.30, 0.80], [0.60, 1.50]]
+      veil_rgb: [[40, 115], [85, 150], [45, 95]]
+  distance_clip_m: [0.5, 15.0]
+  forward_scatter_blur_k: [0.0, 0.25]
+
+effects:
+  vignetting: {prob: 0.5, strength: [0.1, 0.5]}
+  motion_blur: {prob: 0.25, length_px: [3, 15]}
+  defocus: {prob: 0.2, sigma_px: [0.5, 2.0]}
+  noise: {prob: 0.8, shot: [0.0, 0.02], read: [0.0, 0.015]}
+  resolution_loss: {prob: 0.2, factor: [0.4, 0.8]}
+  exposure_ev: [-1.0, 0.7]
+  wb_gain: [0.85, 1.15]

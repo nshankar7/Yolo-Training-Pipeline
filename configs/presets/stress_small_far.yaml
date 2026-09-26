@@ -1,0 +1,7 @@
+# Stress set: only small, distant arrows - the hardest detections.
+output: {root: datasets/stress_small_far}
+splits:
+  train: {count: 0}
+  val:   {count: 500, stream: 7}
+object:
+  apparent_size: {dist: loguniform, range: [0.02, 0.07]}
