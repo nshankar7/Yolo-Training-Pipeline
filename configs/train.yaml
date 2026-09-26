@@ -1,0 +1,48 @@
+# Ultralytics training settings.
+#
+# The `forced` block is not a preference. Those augmentations would turn one arrow design
+# into another design's shape while keeping the original label. Ultralytics enables
+# fliplr=0.5 by default, so leaving this alone would corrupt roughly half the training data.
+
+model: yolo11n.pt
+imgsz: 640
+epochs: 50
+batch: 16
+workers: 4
+
+# 'mps' needs macOS 14+ with current torch. On macOS 13 use 'cpu', or install
+# torch==2.4.1 + torchvision==0.19.1, which still supports MPS there.
+device: cpu
+
+optimizer: SGD          # never 'auto': it ignores lr0 and may differ between rounds
+lr0: 0.01
+warmup_epochs: 3.0
+patience: 50
+seed: 0
+cache: false
+val: true
+plots: true
+project: runs/arrowgen
+name: train
+
+aug:
+  mosaic: 1.0
+  scale: 0.5
+  translate: 0.1
+  hsv_h: 0.015
+  hsv_s: 0.5
+  hsv_v: 0.4
+  close_mosaic: 10
+
+forced:
+  fliplr: 0.0           # mirroring changes the class
+  flipud: 0.0
+  degrees: 0.0          # rotation beyond the sampled roll changes the class
+  shear: 0.0
+  perspective: 0.0      # the generator already applies calibrated perspective
+  mixup: 0.0
+
+rounds:
+  images_per_round: 20000
+  epochs_per_round: 5
+  keep_last: 2

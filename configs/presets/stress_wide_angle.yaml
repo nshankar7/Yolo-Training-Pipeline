@@ -1,0 +1,10 @@
+# Stress set: signs seen from steep angles.
+output: {root: datasets/stress_wide_angle}
+splits:
+  train: {count: 0}
+  val:   {count: 500, stream: 8}
+object:
+  pose:
+    yaw_deg: [-72, 72]
+    pitch_deg: [-50, 50]
+    max_view_angle_deg: 75

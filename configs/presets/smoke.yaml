@@ -1,0 +1,8 @@
+# Tiny and fast: for wiring checks and tests, not for training quality.
+output:
+  root: datasets/smoke
+  image_size: [640, 480]
+  shard_size: 1000
+splits:
+  train: {count: 200, stream: 0, start: 0}
+  val:   {count: 50,  stream: 1, start: 0}

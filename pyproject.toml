@@ -1,0 +1,41 @@
+[project]
+name = "arrowgen"
+version = "0.1.0"
+description = "Synthetic turn-arrow dataset generator for training Ultralytics YOLO detectors on an AUV"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+    "pyyaml>=6.0",
+    "pydantic>=2.6",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# torch 2.10+ only ships macOS 14+ wheels; this cap keeps local training working on
+# macOS 13 and does not restrict Linux/cloud GPU installs.
+train = ["ultralytics>=8.3", "torch<2.10; sys_platform == 'darwin'"]
+photo = ["rembg>=2.0.50"]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+arrowgen = "arrowgen.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/arrowgen"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: long-running tests (multiprocessing, training)"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

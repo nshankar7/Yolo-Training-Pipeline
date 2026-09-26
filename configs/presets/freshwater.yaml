@@ -1,0 +1,4 @@
+# Murky lake/river water only.
+underwater:
+  water_types:
+    pool: {weight: 0.0}

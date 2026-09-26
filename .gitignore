@@ -14,6 +14,16 @@ datasets/
 runs/
 wandb/
 
+# Derived from assets/arrows/raw/ by `arrowgen ingest` - regenerate, don't commit
+assets/arrows/processed/
+
+# Stock background photos: large, and usually under someone else's licence
+assets/backgrounds/stock/*
+!assets/backgrounds/stock/.gitkeep
+
+# Default preview output
+/preview.jpg
+
 # Model weights and exports
 *.pt
 *.pth
