@@ -1,4 +1,4 @@
-"""Command line: ingest -> generate -> preview/stats -> train."""
+"""Command line: ingest -> generate -> preview/stats -> train -> eval, or all of it via run."""
 
 from __future__ import annotations
 
@@ -46,17 +46,21 @@ def cmd_placeholders(args: argparse.Namespace) -> int:
 
 
 def cmd_ingest(args: argparse.Namespace) -> int:
-    classes_cfg = load_classes(args.classes)
-    results = ingest_all(classes_cfg, args.raw, args.out, args.max_side)
+    return _ingest(args.classes, args.raw, args.out, args.max_side, args.review)
+
+
+def _ingest(classes: Path, raw: Path, out: Path, max_side: int, review: Path) -> int:
+    classes_cfg = load_classes(classes)
+    results = ingest_all(classes_cfg, raw, out, max_side)
     by_class: dict[str, int] = {}
     for r in results:
         by_class[r.class_name] = by_class.get(r.class_name, 0) + 1
-    print(f"processed {len(results)} assets into {args.out}")
+    print(f"processed {len(results)} assets into {out}")
     for name in classes_cfg.names:
         derived = classes_cfg.by_name(name).derive
         suffix = f"  (mirrored from {derived.source})" if derived else ""
         print(f"  [{classes_cfg.class_id(name)}] {name:<18} {by_class.get(name, 0)} assets{suffix}")
-    sheet = review_sheet(results, args.review)
+    sheet = review_sheet(results, review)
     print(f"\nreview sheet: {sheet}")
     print("Check that every cutout is clean and its red outline hugs the arrow.")
     return 0
@@ -79,6 +83,11 @@ def cmd_generate(args: argparse.Namespace) -> int:
     summary = generate_dataset(
         cfg, workers=args.workers, overwrite=args.overwrite, progress=not args.quiet
     )
+    _print_summary(summary)
+    return 0
+
+
+def _print_summary(summary: dict) -> None:
     print(f"\ndataset: {summary['root']}")
     print(f"data.yaml: {summary['data_yaml']}")
     for split, s in summary["splits"].items():
@@ -90,7 +99,6 @@ def cmd_generate(args: argparse.Namespace) -> int:
         if s["rejections"]:
             top = list(s["rejections"].items())[:3]
             print(f"    top rejections: {', '.join(f'{k}={v}' for k, v in top)}")
-    return 0
 
 
 def cmd_preview(args: argparse.Namespace) -> int:
@@ -166,6 +174,113 @@ def cmd_train(args: argparse.Namespace) -> int:
     return 0
 
 
+def _stress_sets(args: argparse.Namespace) -> dict[str, Path]:
+    from .evaluate import prepare_stress_sets  # noqa: PLC0415
+
+    return prepare_stress_sets(
+        args.config or [DEFAULT_CONFIG], args.sets, root=args.stress_root,
+        workers=args.workers, progress=not args.quiet,
+    )
+
+
+def _report(weights: Path, datasets: dict[str, Path], train_cfg, out: Path) -> None:
+    from .evaluate import evaluate, format_table, write_csv  # noqa: PLC0415
+
+    rows = evaluate(weights, datasets, train_cfg)
+    print(f"\nweights: {weights}\n")
+    print(format_table(rows))
+    print(f"\nwrote {write_csv(rows, out)}")
+
+
+def cmd_eval(args: argparse.Namespace) -> int:
+    train_cfg = _load_train_cfg(args)
+    if not Path(args.weights).exists():
+        raise SystemExit(f"weights not found: {args.weights}")
+    datasets = {Path(d).parent.name: Path(d) for d in args.data}
+    if args.stress:
+        datasets.update(_stress_sets(args))
+    if not datasets:
+        datasets = {"val": Path(_load_cfg(args).output.root) / "data.yaml"}
+    missing = [str(d) for d in datasets.values() if not d.exists()]
+    if missing:
+        raise SystemExit(f"data.yaml not found: {', '.join(missing)}")
+    out = args.out or Path(args.weights).resolve().parent.parent / "eval.csv"
+    _report(Path(args.weights), datasets, train_cfg, out)
+    return 0
+
+
+def _ingest_is_stale(cfg, raw: Path) -> bool:
+    """True when the processed artwork is missing or older than what it is made from."""
+    processed = Path(cfg.processed_dir)
+    names = load_classes(cfg.classes_file).names
+    outputs = list(processed.rglob("*.png"))
+    if not outputs or any(not any((processed / n).glob("*.png")) for n in names):
+        return True
+    sources = [p for p in Path(raw).rglob("*") if p.is_file()] + [Path(cfg.classes_file)]
+    return max(p.stat().st_mtime for p in sources) > min(p.stat().st_mtime for p in outputs)
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    """ingest -> generate -> train -> evaluate, skipping any step that is already done."""
+    from .train import completed_rounds, run_train, train_rounds  # noqa: PLC0415
+    from .writer import generate_dataset, split_is_current, split_plans  # noqa: PLC0415
+
+    cfg = _load_cfg(args)
+    train_cfg = _load_train_cfg(args)  # a bad train config should fail now, not in hours
+    root = Path(cfg.output.root)
+
+    print("== 1/4 ingest")
+    if args.skip_ingest:
+        print("skipped (--skip-ingest)")
+    elif _ingest_is_stale(cfg, args.raw):
+        _ingest(Path(cfg.classes_file), args.raw, Path(cfg.processed_dir), args.max_side,
+                Path(cfg.processed_dir) / "_review.jpg")
+    else:
+        print(f"up to date: {cfg.processed_dir}")
+
+    if args.rounds >= 1:
+        print(f"== 2-3/4 generate and train, {args.rounds} rounds")
+        train_rounds(cfg, train_cfg, args.rounds, workers=args.workers,
+                     progress=not args.quiet, fresh=args.fresh)
+        last = completed_rounds(root / "rounds.csv")[-1]
+        weights = Path(last["weights"])
+        val_yaml = root / f"data_r{int(last['round']):03d}.yaml"
+    else:
+        print("== 2/4 generate")
+        plans = [p for p in split_plans(cfg) if p.count > 0]
+        if (root / "data.yaml").exists() and all(split_is_current(cfg, p) for p in plans):
+            print(f"up to date: {root}")
+        else:
+            _print_summary(generate_dataset(
+                cfg, workers=args.workers, overwrite=True, progress=not args.quiet
+            ))
+        print("== 3/4 train")
+        _, save_dir = run_train(train_cfg, root / "data.yaml")
+        best = save_dir / "weights" / "best.pt"
+        weights = best if best.exists() else save_dir / "weights" / "last.pt"
+        val_yaml = root / "data.yaml"
+
+    print("== 4/4 evaluate")
+    datasets = {"val": val_yaml}
+    if args.stress:
+        datasets.update(_stress_sets(args))
+    _report(weights, datasets, train_cfg, weights.resolve().parent.parent / "eval.csv")
+    return 0
+
+
+def _add_train_config_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("-t", "--train-config", type=Path, default=DEFAULT_TRAIN_CONFIG)
+    p.add_argument("--set-train", action="append", default=[], metavar="KEY=VALUE")
+
+
+def _add_stress_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--stress", action="store_true",
+                   help="also score the stress presets (generated if missing or stale)")
+    p.add_argument("--stress-root", type=Path,
+                   help="write stress sets under this folder instead of their preset roots")
+    p.add_argument("--quiet", action="store_true")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="arrowgen",
@@ -223,7 +338,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("train", help="train YOLO on a generated dataset")
     _add_config_args(sp)
-    sp.add_argument("-t", "--train-config", type=Path, default=DEFAULT_TRAIN_CONFIG)
+    _add_train_config_args(sp)
     sp.add_argument("--data", type=Path, help="path to data.yaml")
     sp.add_argument(
         "--rounds", type=int, default=0,
@@ -234,8 +349,31 @@ def build_parser() -> argparse.ArgumentParser:
         "--fresh", action="store_true",
         help="with --rounds: set rounds.csv aside and start from round 0 instead of resuming",
     )
-    sp.add_argument("--set-train", action="append", default=[], metavar="KEY=VALUE")
     sp.set_defaults(func=cmd_train)
+
+    sp = sub.add_parser("eval", help="score weights on val and the stress sets")
+    _add_config_args(sp)
+    _add_train_config_args(sp)
+    _add_stress_args(sp)
+    sp.add_argument("--weights", type=Path, required=True)
+    sp.add_argument("--data", type=Path, action="append", default=[],
+                    help="data.yaml to score; repeat for several (default: config's dataset)")
+    sp.add_argument("--workers", type=int, default=0, help="stress-set generation workers")
+    sp.add_argument("--out", type=Path, help="CSV path (default: <run dir>/eval.csv)")
+    sp.set_defaults(func=cmd_eval)
+
+    sp = sub.add_parser("run", help="ingest, generate, train and evaluate in one go")
+    _add_config_args(sp)
+    _add_train_config_args(sp)
+    _add_stress_args(sp)
+    sp.add_argument("--raw", type=Path, default=Path("assets/arrows/raw"))
+    sp.add_argument("--max-side", type=int, default=768)
+    sp.add_argument("--skip-ingest", action="store_true")
+    sp.add_argument("--rounds", type=int, default=0,
+                    help="train in N rounds of fresh images instead of one fixed dataset")
+    sp.add_argument("--fresh", action="store_true", help="with --rounds: do not resume")
+    sp.add_argument("--workers", type=int, default=0, help="generation worker processes")
+    sp.set_defaults(func=cmd_run)
     return p
 
 

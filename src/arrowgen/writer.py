@@ -304,8 +304,13 @@ def generate_dataset(  # noqa: PLR0913
              "round": round_}
         ))
 
-    train_name = next((p.name for p in plans if p.role == ROLE_TRAIN), "train")
     val_name = next((p.name for p in plans if p.role == ROLE_VAL), "val")
+    has_val_only = all(p.role == ROLE_VAL for p in plans)
+    # A val-only set (a stress preset) must still name an existing train folder, or
+    # Ultralytics refuses the whole data.yaml. Nothing trains on it.
+    train_name = next(
+        (p.name for p in plans if p.role == ROLE_TRAIN), val_name if has_val_only else "train"
+    )
     data_yaml = write_data_yaml(cfg, class_names, train_name, val_name, yaml_name)
     meta_doc = {
         "arrowgen_version": __version__,

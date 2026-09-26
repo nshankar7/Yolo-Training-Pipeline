@@ -17,11 +17,20 @@ procedural   ─┴──► scenes ──► place, light, submerge ──► i
 uv sync --extra dev --extra train      # one-time setup (Python 3.11 venv in .venv/)
 
 uv run arrowgen placeholders           # stand-in artwork, replace with your own
-uv run arrowgen ingest                 # cut out the arrows, derive mirrored classes
-uv run arrowgen generate --train 20000 --val 2000 --workers 6
-uv run arrowgen preview --dataset datasets/arrows_v1 --split train -n 64
-uv run arrowgen train                  # Ultralytics, with label-unsafe augmentation disabled
+uv run arrowgen run --workers 6 --stress
 ```
+
+`run` does the whole pipeline and skips any step that is already done: it ingests only when
+the raw artwork or classes.yaml changed, regenerates only when the settings changed, trains,
+then scores the weights on val and on every stress preset. Check the data before a long run:
+
+```bash
+uv run arrowgen ingest                 # then open assets/arrows/processed/_review.jpg
+uv run arrowgen generate -c configs/generate.yaml -c configs/presets/smoke.yaml --overwrite
+uv run arrowgen preview --dataset datasets/smoke --split train -n 64
+```
+
+Each step also runs on its own: `ingest`, `generate`, `train`, `eval` (see Commands).
 
 ## Using your own arrows
 
@@ -93,6 +102,8 @@ far arrow is hazier and bluer than a near one, and haze colour is read from the 
 | `arrowgen stats` | Class balance, size/distance histograms, rejection reasons |
 | `arrowgen bench` | Generation throughput |
 | `arrowgen train` | Train Ultralytics; `--rounds N` retrains on fresh images each round |
+| `arrowgen eval` | Score `--weights` on val, extra `--data` sets, and the stress presets (`--stress`) |
+| `arrowgen run` | ingest → generate → train → eval in one go, skipping finished steps |
 
 Configs layer: `-c configs/generate.yaml -c configs/presets/pool.yaml`, and single values
 override with `--set object.pose.yaw_deg='[-30, 30]'`.
@@ -102,12 +113,14 @@ override with `--set object.pose.yaw_deg='[-30, 30]'`.
 Every image is a pure function of `(config, seed, stream, round, index)`, so the index space
 is unbounded and any image can be rebuilt exactly. `arrowgen train --rounds N` generates a
 fresh batch each round from indices that have never been used, trains on it from the previous
-weights, logs to `rounds.csv`, and prunes old rounds.
+weights, logs to `rounds.csv`, and prunes old rounds. N is the total wanted: if a run is
+interrupted, the same command resumes from the last finished round (`--fresh` starts over).
+Validation data is generated once and reused while its settings are unchanged.
 
 ## Checking the data
 
 ```bash
-uv run pytest                                          # 59 tests
+uv run pytest                                          # 79 tests
 uv run arrowgen preview --dataset datasets/arrows_v1 --split train -n 64
 uv run arrowgen stats --dataset datasets/arrows_v1 --split train
 ```
@@ -119,18 +132,21 @@ byte-identical whatever the worker count, and that derived mirror classes really
 Also look at Ultralytics' own `labels.jpg` and `train_batch*.jpg` in the run directory: they
 show what the model actually receives.
 
-Without real footage, use the stress presets to find weaknesses per condition:
+Without real footage, use the stress presets to find weaknesses per condition. Each is
+generated on first use and reused after that:
 
 ```bash
-for p in stress_small_far stress_wide_angle stress_low_light stress_turbid; do
-  uv run arrowgen generate -c configs/generate.yaml -c configs/presets/$p.yaml --overwrite
-done
+uv run arrowgen eval --weights runs/arrowgen/train/weights/best.pt --stress
 ```
 
-Add a real hand-labelled set later by pointing `--data` at it; no code change is needed.
+This prints one row per set (mAP50, mAP50-95, precision, recall, per-class mAP50) and writes
+`eval.csv` beside the weights. Score a real hand-labelled set later by adding
+`--data real/data.yaml`; no code change is needed.
 
 ## Hardware notes
 
+- `generate` and `train --rounds` check free disk before writing and stop early if the
+  images will not fit (about 0.15 MB per 960×720 image, plus 1 GB headroom).
 - Generation is CPU-bound. Measured on an M2 with `--workers 6`: 29 images/s at 960×720
   (20k images ≈ 12 min, ≈ 3 GB of JPEGs) and 61 images/s at 640×480. Check free disk before
   generating a large set.
