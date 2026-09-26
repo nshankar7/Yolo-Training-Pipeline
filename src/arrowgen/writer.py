@@ -7,6 +7,7 @@ ordered and makes any single image reproducible from its index alone.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing as mp
 import platform
@@ -47,6 +48,58 @@ def split_plans(cfg: GenerateConfig) -> list[SplitPlan]:
         SplitPlan("train", s.train.stream, s.train.start, s.train.count, ROLE_TRAIN),
         SplitPlan("val", s.val.stream, s.val.start, s.val.count, ROLE_VAL),
     ]
+
+
+# Measured: about 0.15 MB of JPEG per 960x720 image across the default quality range.
+JPEG_BYTES_PER_PIXEL = 0.15e6 / (960 * 720)
+DISK_HEADROOM_BYTES = 1 << 30  # leave 1 GB free for Ultralytics caches, runs and the OS
+
+
+def estimate_bytes(n_images: int, image_size: tuple[int, int]) -> int:
+    return int(n_images * image_size[0] * image_size[1] * JPEG_BYTES_PER_PIXEL)
+
+
+def _tree_bytes(path: Path) -> int:
+    if path.is_file():
+        return path.stat().st_size
+    if not path.is_dir():
+        return 0
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+
+def check_disk(root: Path, needed: int, reclaimable: int = 0) -> None:
+    """Fail before generating, not halfway through, when the images will not fit."""
+    probe = Path(root)
+    while not probe.exists():
+        probe = probe.parent
+    free = shutil.disk_usage(probe).free + reclaimable
+    if needed + DISK_HEADROOM_BYTES > free:
+        raise ValueError(
+            f"not enough disk space under {probe}: need about {needed / 1e9:.1f} GB plus "
+            f"{DISK_HEADROOM_BYTES / 1e9:.1f} GB headroom, but only {free / 1e9:.1f} GB is free. "
+            "Generate fewer images, a smaller image_size, or free some space."
+        )
+
+
+def split_signature(cfg: GenerateConfig, plan: SplitPlan, round_: int) -> str:
+    """Hash of everything that determines a split's images, and nothing else.
+
+    Split counts and the output root are left out: they decide how many images exist and
+    where they live, not what any one image looks like.
+    """
+    data = json.loads(cfg.model_dump_json())
+    data.pop("splits")
+    data["output"].pop("root")
+    data["plan"] = [plan.name, plan.stream, plan.start, plan.count, plan.role, round_]
+    return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def split_is_current(cfg: GenerateConfig, plan: SplitPlan, round_: int = 0) -> bool:
+    """True when this split already exists on disk, generated from the same settings."""
+    meta = Path(cfg.output.root) / "manifest" / f"{plan.name}.meta.json"
+    if not meta.exists():
+        return False
+    return json.loads(meta.read_text()).get("signature") == split_signature(cfg, plan, round_)
 
 
 def image_path(root: Path, split: str, index: int, shard_size: int) -> Path:
@@ -181,6 +234,7 @@ def generate_dataset(  # noqa: PLR0913
     progress: bool = True,
     plans: list[SplitPlan] | None = None,
     yaml_name: str = "data.yaml",
+    check_space: bool = True,
 ) -> dict:
     """Generate the given splits and write data.yaml, the manifest and dataset_meta.json."""
     root = Path(cfg.output.root)
@@ -188,22 +242,29 @@ def generate_dataset(  # noqa: PLR0913
     if not plans:
         raise ValueError("nothing to generate: every split count is zero")
 
+    occupied: list[Path] = []
     for plan in plans:
         targets = [
             root / "images" / plan.name,
             root / "labels" / plan.name,
             root / "manifest" / f"{plan.name}.jsonl",
+            root / "manifest" / f"{plan.name}.meta.json",
         ]
         for target in targets:
-            occupied = target.is_file() or (target.is_dir() and any(target.rglob("*")))
-            if not occupied:
+            if not (target.is_file() or (target.is_dir() and any(target.rglob("*")))):
                 continue
             if not overwrite:
                 raise FileExistsError(
                     f"{target} already exists. Pass --overwrite to replace this split, "
                     "or choose a different output.root."
                 )
-            shutil.rmtree(target) if target.is_dir() else target.unlink()
+            occupied.append(target)
+
+    if check_space:
+        needed = estimate_bytes(sum(p.count for p in plans), cfg.output.image_size)
+        check_disk(root, needed, reclaimable=sum(_tree_bytes(t) for t in occupied))
+    for target in occupied:
+        shutil.rmtree(target) if target.is_dir() else target.unlink()
 
     ctx = GenContext.build(cfg)
     class_names = ctx.classes.names
@@ -237,6 +298,11 @@ def generate_dataset(  # noqa: PLR0913
                     bar.update(1)
         bar.close()
         summary["splits"][plan.name] = summarise(metas, class_names)
+        # Written last, so a split interrupted mid-way never looks current.
+        (root / "manifest" / f"{plan.name}.meta.json").write_text(json.dumps(
+            {"signature": split_signature(cfg, plan, round_), "count": plan.count,
+             "round": round_}
+        ))
 
     train_name = next((p.name for p in plans if p.role == ROLE_TRAIN), "train")
     val_name = next((p.name for p in plans if p.role == ROLE_VAL), "val")

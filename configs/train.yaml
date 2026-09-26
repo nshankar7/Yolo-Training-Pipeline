@@ -42,6 +42,10 @@ forced:
   perspective: 0.0      # the generator already applies calibrated perspective
   mixup: 0.0
 
+# `arrowgen train --rounds N` trains until N rounds are recorded in rounds.csv, so re-running
+# after an interruption resumes (use --fresh to start over). Each round is a new Ultralytics
+# run: the LR schedule restarts per round, and only the final round closes mosaic, for its
+# second half (min(close_mosaic, epochs_per_round // 2) epochs).
 rounds:
   images_per_round: 20000
   epochs_per_round: 5

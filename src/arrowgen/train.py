@@ -13,6 +13,7 @@ Two things here are not conveniences but correctness:
 from __future__ import annotations
 
 import csv
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -21,7 +22,7 @@ from pydantic import model_validator
 
 from .config import Base, GenerateConfig, apply_sets, deep_merge, load_yaml
 from .registry import ROLE_TRAIN, ROLE_VAL
-from .writer import SplitPlan, generate_dataset
+from .writer import SplitPlan, check_disk, estimate_bytes, generate_dataset, split_is_current
 
 FORCED_REASON = (
     "arrowgen forces this to 0: mirrored/rotated arrows belong to a different class, "
@@ -71,7 +72,7 @@ class TrainConfig(Base):
     epochs: int = 50
     batch: int = 16
     workers: int = 4
-    device: str = "mps"
+    device: str = "cpu"  # works everywhere; set "mps" or a GPU index explicitly
     optimizer: str = "SGD"  # never "auto": it ignores lr0 and can change between rounds
     lr0: float = 0.01
     warmup_epochs: float = 3.0
@@ -175,6 +176,14 @@ def _append_csv(path: Path, row: dict) -> None:
         writer.writerow(row)
 
 
+def completed_rounds(rounds_csv: Path) -> list[dict]:
+    """Rows already written by earlier invocations, oldest first."""
+    if not rounds_csv.exists():
+        return []
+    with open(rounds_csv, newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
 def train_rounds(  # noqa: PLR0913
     gen_cfg: GenerateConfig,
     train_cfg: TrainConfig,
@@ -182,15 +191,47 @@ def train_rounds(  # noqa: PLR0913
     workers: int = 0,
     progress: bool = True,
     keep_val: bool = True,
+    fresh: bool = False,
 ) -> list[dict]:
     """Generate a fresh batch of images and train on it, repeatedly.
 
     Round r uses indices [start + r*N, start + (r+1)*N), so no image is ever seen twice.
     Validation data is generated once and held fixed, so rounds are comparable.
+
+    `rounds` is the total wanted. Rounds already recorded in rounds.csv are skipped and
+    training continues from the last one's weights, so an interrupted run can simply be
+    started again. `fresh` sets the old history aside and starts from round 0.
     """
     root = Path(gen_cfg.output.root)
     rounds_csv = root / "rounds.csv"
     n = train_cfg.rounds.images_per_round
+
+    if fresh and rounds_csv.exists():
+        aside = rounds_csv.with_name(f"rounds.{time.strftime('%Y%m%d-%H%M%S')}.csv")
+        rounds_csv.rename(aside)
+        print(f"[arrowgen] previous history moved to {aside.name}")
+
+    done = completed_rounds(rounds_csv)
+    weights = train_cfg.model
+    if done:
+        last = done[-1]
+        if int(last.get("images", n)) != n:
+            raise ValueError(
+                f"{rounds_csv} was written with images_per_round={last['images']}, not {n}; "
+                "resuming would reuse or skip image indices. Pass --fresh to start over."
+            )
+        weights = last["weights"]
+        if not Path(weights).exists():
+            raise FileNotFoundError(
+                f"cannot resume: round {last['round']} weights are missing ({weights}). "
+                "Pass --fresh to start over."
+            )
+    first = len(done)
+    if first >= rounds:
+        print(f"[arrowgen] {first} rounds already recorded in {rounds_csv}; nothing to do")
+        return []
+    if first:
+        print(f"[arrowgen] resuming at round {first} from {weights}")
 
     epoch_images = n * train_cfg.rounds.epochs_per_round
     if epoch_images < train_cfg.nbs:
@@ -200,27 +241,35 @@ def train_rounds(  # noqa: PLR0913
             f"change. Use more images per round, or set nbs to at most {max(1, n // 2)}."
         )
 
-    val_dir = root / "images" / "val"
-    if not (keep_val and val_dir.exists() and any(val_dir.rglob("*.jpg"))):
-        val_plan = SplitPlan(
-            "val", gen_cfg.splits.val.stream, gen_cfg.splits.val.start,
-            gen_cfg.splits.val.count, ROLE_VAL,
-        )
+    val_plan = SplitPlan(
+        "val", gen_cfg.splits.val.stream, gen_cfg.splits.val.start,
+        gen_cfg.splits.val.count, ROLE_VAL,
+    )
+    reuse_val = keep_val and split_is_current(gen_cfg, val_plan)
+    # Peak usage: the rounds kept on disk, the one being written, and val.
+    peak = n * (train_cfg.rounds.keep_last + 1) + (0 if reuse_val else val_plan.count)
+    check_disk(root, estimate_bytes(peak, gen_cfg.output.image_size))
+
+    if not reuse_val:
         generate_dataset(
             gen_cfg, workers=workers, overwrite=True, progress=progress, plans=[val_plan],
-            yaml_name="data_val_only.yaml",
+            yaml_name="data_val_only.yaml", check_space=False,
         )
 
+    # Each round is a fresh Ultralytics run, so the LR schedule restarts every round. The
+    # final round closes mosaic for its second half; closing it for the whole round (as
+    # close_mosaic >= epochs_per_round would) leaves no mosaic epochs at all.
+    final_close_mosaic = min(train_cfg.aug.close_mosaic, train_cfg.rounds.epochs_per_round // 2)
+
     history: list[dict] = []
-    weights = train_cfg.model
-    for r in range(rounds):
+    for r in range(first, rounds):
         started = time.time()
         split_name = f"train_r{r:03d}"
         start_index = gen_cfg.splits.train.start + r * n
         plan = SplitPlan(split_name, gen_cfg.splits.train.stream, start_index, n, ROLE_TRAIN)
         generate_dataset(
             gen_cfg, workers=workers, round_=r, overwrite=True, progress=progress,
-            plans=[plan], yaml_name=f"data_r{r:03d}.yaml",
+            plans=[plan], yaml_name=f"data_r{r:03d}.yaml", check_space=False,
         )
         data_yaml = root / f"data_r{r:03d}.yaml"
 
@@ -232,7 +281,7 @@ def train_rounds(  # noqa: PLR0913
             epochs=train_cfg.rounds.epochs_per_round,
             name=f"{train_cfg.name}_r{r:03d}",
             warmup_epochs=train_cfg.warmup_epochs if r == 0 else 0.0,
-            close_mosaic=train_cfg.aug.close_mosaic if final_round else 0,
+            close_mosaic=final_close_mosaic if final_round else 0,
         )
         weights = str(save_dir / "weights" / "last.pt")
         row = {
@@ -252,7 +301,5 @@ def train_rounds(  # noqa: PLR0913
             for sub in ("images", "labels"):
                 target = root / sub / f"train_r{old:03d}"
                 if target.exists():
-                    import shutil  # noqa: PLC0415
-
                     shutil.rmtree(target)
     return history

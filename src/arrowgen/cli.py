@@ -130,15 +130,28 @@ def cmd_bench(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_train(args: argparse.Namespace) -> int:
-    from .train import load_train_config, run_train, train_rounds  # noqa: PLC0415
+def _load_train_cfg(args: argparse.Namespace):
+    from .train import load_train_config  # noqa: PLC0415
 
-    train_cfg = load_train_config(
-        [args.train_config] if Path(args.train_config).exists() else [], args.set_train
-    )
-    if args.rounds and args.rounds > 1:
+    path = Path(args.train_config)
+    if not path.exists():
+        # Only the default may be absent. A path the user typed that does not exist is a
+        # mistake, and silently training with built-in defaults would hide it.
+        if path != DEFAULT_TRAIN_CONFIG:
+            raise SystemExit(f"train config not found: {path}")
+        return load_train_config([], args.set_train)
+    return load_train_config([path], args.set_train)
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    from .train import run_train, train_rounds  # noqa: PLC0415
+
+    train_cfg = _load_train_cfg(args)
+    if args.rounds and args.rounds >= 1:
         cfg = _load_cfg(args)
-        history = train_rounds(cfg, train_cfg, args.rounds, workers=args.workers)
+        history = train_rounds(
+            cfg, train_cfg, args.rounds, workers=args.workers, fresh=args.fresh
+        )
         print(f"\ncompleted {len(history)} rounds; history: {Path(cfg.output.root) / 'rounds.csv'}")
         return 0
 
@@ -212,8 +225,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config_args(sp)
     sp.add_argument("-t", "--train-config", type=Path, default=DEFAULT_TRAIN_CONFIG)
     sp.add_argument("--data", type=Path, help="path to data.yaml")
-    sp.add_argument("--rounds", type=int, default=0, help="train on N rounds of fresh images")
+    sp.add_argument(
+        "--rounds", type=int, default=0,
+        help="train until N rounds of fresh images are done; re-running resumes",
+    )
     sp.add_argument("--workers", type=int, default=0, help="generation workers between rounds")
+    sp.add_argument(
+        "--fresh", action="store_true",
+        help="with --rounds: set rounds.csv aside and start from round 0 instead of resuming",
+    )
     sp.add_argument("--set-train", action="append", default=[], metavar="KEY=VALUE")
     sp.set_defaults(func=cmd_train)
     return p
